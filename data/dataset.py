@@ -6,136 +6,122 @@ from PIL import Image
 
 DEFECT_CLASSES = ['open', 'short', 'mousebite', 'spur', 'pinhole', 'spurious_copper']
 
-_IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp')
-
 
 def _find_pairs(root):
     """
-    Scan root recursively, return (template, test, annotation) triples.
-    Tries four strategies from most-specific to most-general.
+    Return (template_path, test_path, annotation_path) triples from the DeepPCB repo.
+
+    Actual repo structure (confirmed by inspection):
+        root/
+          PCBData/
+            trainval.txt     <- "groupXX/XX/XXX.jpg  groupXX/XX_not/XXX.txt"
+            test.txt
+            groupXXXXX/
+              XXXXX/         <- test images + template images
+                XXXXXXXX.jpg          (test image, NO _test suffix)
+                XXXXXXXX_temp.jpg     (template image)
+              XXXXX_not/     <- annotation txts
+                XXXXXXXX.txt
     """
     pairs = []
 
-    # ── Strategy 1: standard DeepPCB — *_temp.jpg / *_test.jpg / *_test.txt ──
-    for ext in ('.jpg', '.jpeg', '.png'):
-        for temp in glob.glob(os.path.join(root, '**', f'*_temp{ext}'), recursive=True):
-            base = temp[:-len(f'_temp{ext}')]
-            for test_ext in ('.jpg', '.jpeg', '.png'):
-                test = base + f'_test{test_ext}'
-                ann  = base + '_test.txt'
-                if os.path.exists(test) and os.path.exists(ann):
-                    pairs.append((temp, test, ann))
-                    break
-    if pairs:
-        return pairs
+    # Locate PCBData sub-directory (or use root if already there)
+    pcb_data = os.path.join(root, 'PCBData')
+    if not os.path.isdir(pcb_data):
+        pcb_data = root
 
-    # ── Strategy 2: any *_test.txt → derive image paths ─────────────────────
-    for ann in glob.glob(os.path.join(root, '**', '*_test.txt'), recursive=True):
-        base = ann[:-len('_test.txt')]
-        test = _first_existing([base + f'_test{e}' for e in _IMG_EXTS]
-                               + [base + e for e in _IMG_EXTS])
-        temp = _first_existing([base + f'_temp{e}' for e in _IMG_EXTS]
-                               + [base + f'_template{e}' for e in _IMG_EXTS])
-        if test and temp:
-            pairs.append((temp, test, ann))
-    if pairs:
-        return pairs
-
-    # ── Strategy 3: trainval.txt / test.txt split files ─────────────────────
-    for split_file in ['trainval.txt', 'test.txt']:
-        sf = os.path.join(root, split_file)
+    # ── Strategy 1: use official split files (trainval.txt / test.txt) ────────
+    for split_name in ('trainval.txt', 'test.txt'):
+        sf = os.path.join(pcb_data, split_name)
         if not os.path.exists(sf):
             continue
-        pcb_data = os.path.join(root, 'PCBData')
-        if not os.path.isdir(pcb_data):
-            pcb_data = root
         with open(sf) as fh:
             for line in fh:
                 parts = line.strip().split()
-                if not parts:
+                if len(parts) < 2:
                     continue
-                img_rel = parts[0]
-                ann_rel = parts[1] if len(parts) > 1 else img_rel.replace('.jpg', '.txt')
-                img_path = os.path.join(pcb_data, img_rel)
-                ann_path = os.path.join(pcb_data, ann_rel)
-                base = os.path.splitext(img_path)[0]
-                temp_path = _first_existing(
-                    [base.replace('_test', '_temp') + e for e in _IMG_EXTS]
-                    + [os.path.splitext(img_path)[0].replace(
-                        os.path.basename(img_path).split('_')[0],
-                        os.path.basename(img_path).split('_')[0]) + e for e in _IMG_EXTS]
-                )
-                if os.path.exists(img_path) and temp_path:
-                    pairs.append((temp_path, img_path, ann_path))
+                test_rel, ann_rel = parts[0], parts[1]
+                test_path = os.path.join(pcb_data, test_rel)
+                ann_path  = os.path.join(pcb_data, ann_rel)
+                # Template = same directory, same basename + _temp.jpg
+                stem = os.path.splitext(test_rel)[0]   # e.g. group20085/20085/20085000
+                temp_path = os.path.join(pcb_data, stem + '_temp.jpg')
+                if os.path.exists(test_path) and os.path.exists(temp_path):
+                    pairs.append((temp_path, test_path, ann_path))
+
     if pairs:
         return pairs
 
-    # ── Strategy 4: brute-force — any folder with ≥2 images + ≥1 .txt ──────
-    # Works when naming is completely unknown (e.g. 0001.jpg, 0002.jpg, 0001.txt)
-    for dirpath, _, filenames in os.walk(root):
-        imgs = sorted([f for f in filenames if f.lower().endswith(_IMG_EXTS)])
-        txts = sorted([f for f in filenames if f.lower().endswith('.txt')
-                       and f not in ('trainval.txt', 'test.txt', 'README.txt')])
-        if len(imgs) < 2 or not txts:
+    # ── Strategy 2: scan for *_temp.jpg, infer test + annotation paths ────────
+    # Handles cases where trainval.txt is absent but directory layout is intact.
+    for temp in glob.glob(os.path.join(root, '**', '*_temp.jpg'), recursive=True):
+        stem = temp[:-len('_temp.jpg')]   # e.g. .../20085/20085000
+        test = stem + '.jpg'              # test image has NO suffix
+        if not os.path.exists(test):
+            test = stem + '_test.jpg'     # older convention
+        if not os.path.exists(test):
             continue
-        # pair consecutive images: even index = template, odd index = test
-        for i in range(0, len(imgs) - 1, 2):
-            temp = os.path.join(dirpath, imgs[i])
-            test = os.path.join(dirpath, imgs[i + 1])
-            stem = os.path.splitext(imgs[i + 1])[0]
-            ann_match = [os.path.join(dirpath, t) for t in txts if os.path.splitext(t)[0] == stem]
-            ann = ann_match[0] if ann_match else os.path.join(dirpath, txts[0])
-            pairs.append((temp, test, ann))
+
+        # Annotation lives in a sibling folder named <subdir>_not/
+        # e.g.  .../group20085/20085/20085000_temp.jpg
+        #        → .../group20085/20085_not/20085000.txt
+        subdir   = os.path.dirname(stem)           # .../group20085/20085
+        basename = os.path.basename(stem)          # 20085000
+        parent   = os.path.dirname(subdir)         # .../group20085
+        not_dir  = os.path.join(parent, os.path.basename(subdir) + '_not')
+        ann = os.path.join(not_dir, basename + '.txt')
+        if not os.path.exists(ann):
+            ann = stem + '.txt'           # same folder fallback
+        if not os.path.exists(ann):
+            ann = stem + '_test.txt'
+
+        pairs.append((temp, test, ann))
+
     return pairs
 
 
-def _first_existing(paths):
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    return None
-
-
 class DeepPCBDataset(Dataset):
-    """
-    DeepPCB dataset — auto-detects naming convention.
-    Dataset: https://github.com/tangsanli5201/DeepPCB
-    """
+    """DeepPCB dataset. https://github.com/tangsanli5201/DeepPCB"""
 
     def __init__(self, root, split='train', transform=None):
-        self.root = root
         self.transform = transform
 
         all_pairs = _find_pairs(root)
 
         if not all_pairs:
-            # Print directory tree for diagnosis
-            tree = []
-            for dirpath, _, filenames in os.walk(root):
-                depth = dirpath.replace(root, '').count(os.sep)
-                if depth > 3:
+            # Print directory tree so the caller can diagnose
+            lines = []
+            for dp, _, fnames in os.walk(root):
+                depth = dp.replace(root, '').count(os.sep)
+                if depth > 5:
                     continue
-                tree.append(f"{'  '*depth}{os.path.basename(dirpath)}/")
-                for f in sorted(filenames)[:8]:
-                    tree.append(f"{'  '*(depth+1)}{f}")
+                lines.append('  ' * depth + os.path.basename(dp) + '/')
+                for fn in sorted(fnames)[:6]:
+                    sz = os.path.getsize(os.path.join(dp, fn))
+                    lines.append('  ' * (depth + 1) + f'{fn}  ({sz} B)')
             raise RuntimeError(
-                f"No PCB pairs found under '{root}'.\n"
-                "Check that images were downloaded (not LFS pointers).\n"
-                + '\n'.join(tree)
+                f"No pairs found under '{root}'.\n" + '\n'.join(lines)
             )
 
-        # 80 / 20 split by parent folder
-        groups = sorted({os.path.dirname(p[0]) for p in all_pairs})
+        # Split 80 / 20 by top-level group folder (two levels up from image file)
+        def _group_key(path):
+            # path: .../PCBData/group20085/20085/20085000_temp.jpg
+            # key : .../PCBData/group20085
+            return os.path.dirname(os.path.dirname(path))
+
+        groups = sorted({_group_key(p[0]) for p in all_pairs})
         n = len(groups)
         n_train = max(1, int(n * 0.8))
         n_val   = max(1, n - n_train)
+
         if n == 1:
             keep = set(groups)
         elif split == 'train':
             keep = set(groups[:n_train])
         else:
             keep = set(groups[n - n_val:])
-        self.pairs = [p for p in all_pairs if os.path.dirname(p[0]) in keep]
+
+        self.pairs = [p for p in all_pairs if _group_key(p[0]) in keep]
 
     def __len__(self):
         return len(self.pairs)
@@ -153,13 +139,14 @@ class DeepPCBDataset(Dataset):
                     parts = line.strip().split()
                     if len(parts) < 5:
                         continue
-                    x1, y1, x2, y2, cls = (int(parts[k]) for k in range(5))
-                    cx = (x1 + x2) / 2 / W
-                    cy = (y1 + y2) / 2 / H
-                    bw = (x2 - x1) / W
-                    bh = (y2 - y1) / H
-                    boxes.append([cx, cy, bw, bh])
-                    labels.append(cls - 1)
+                    x1, y1, x2, y2, cls = (int(p) for p in parts[:5])
+                    boxes.append([
+                        (x1 + x2) / 2 / W,
+                        (y1 + y2) / 2 / H,
+                        (x2 - x1) / W,
+                        (y2 - y1) / H,
+                    ])
+                    labels.append(cls - 1)   # 1-indexed → 0-indexed
 
         if self.transform:
             template, test_img = self.transform(template, test_img)
