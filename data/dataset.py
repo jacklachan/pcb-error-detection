@@ -95,7 +95,15 @@ class DeepPCBDataset(Dataset):
         # 80 / 20 deterministic split by parent folder
         groups = sorted({os.path.dirname(p[0]) for p in all_pairs})
         n = len(groups)
-        keep = set(groups[:int(n * 0.8)]) if split == 'train' else set(groups[int(n * 0.8):])
+        n_train = max(1, int(n * 0.8))        # at least 1 group for train
+        n_val   = max(1, n - n_train)          # at least 1 group for val
+        if n == 1:
+            # single group — share it across both splits (better than crashing)
+            keep = set(groups)
+        elif split == 'train':
+            keep = set(groups[:n_train])
+        else:
+            keep = set(groups[n - n_val:])
         self.pairs = [p for p in all_pairs if os.path.dirname(p[0]) in keep]
 
     def __len__(self):
